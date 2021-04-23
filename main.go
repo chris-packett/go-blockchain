@@ -1,18 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
-	"net/http"
+	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 )
 
@@ -26,11 +27,9 @@ type Block struct {
 
 var Blockchain []Block
 
-type Message struct {
-	BPM int
-}
-
 var mutex = &sync.Mutex{}
+
+var bcServer chan []Block
 
 func main() {
 	err := godotenv.Load()
@@ -39,107 +38,102 @@ func main() {
 		log.Fatal(err)
 	}
 
-	go func() {
-		genesisBlock := Block{}
-		genesisBlock = Block{
-			Index:     0,
-			Timestamp: time.Now().String(),
-			BPM:       0,
-			Hash:      calculateHash(genesisBlock),
-			PrevHash:  "",
+	bcServer = make(chan []Block)
+
+	genesisBlock := Block{}
+	genesisBlock = Block{
+		Index:     0,
+		Timestamp: time.Now().String(),
+		BPM:       0,
+		Hash:      calculateHash(genesisBlock),
+		PrevHash:  "",
+	}
+
+	spew.Dump(genesisBlock)
+
+	mutex.Lock()
+	Blockchain = append(Blockchain, genesisBlock)
+	mutex.Unlock()
+
+	tcpPort := os.Getenv("PORT")
+
+	server, err := net.Listen("tcp", ":"+tcpPort)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("TCP server listening on port:", tcpPort)
+
+	defer server.Close()
+
+	for {
+		conn, err := server.Accept()
+
+		if err != nil {
+			log.Fatal(err)
 		}
 
-		spew.Dump(genesisBlock)
+		go handleConn(conn)
+	}
+}
 
-		mutex.Lock()
-		Blockchain = append(Blockchain, genesisBlock)
-		mutex.Unlock()
+func handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	io.WriteString(conn, "Enter a new BPM:")
+
+	scanner := bufio.NewScanner(conn)
+
+	go func() {
+		for scanner.Scan() {
+			bpm, err := strconv.Atoi(scanner.Text())
+
+			if err != nil {
+				log.Printf("%v is not a number: %v", scanner.Text(), err)
+				continue
+			}
+
+			oldBlock := Blockchain[len(Blockchain)-1]
+
+			newBlock, err := generateBlock(oldBlock, bpm)
+
+			if err != nil {
+				log.Println(err)
+				continue
+			}
+
+			if isBlockValid(newBlock, oldBlock) {
+				mutex.Lock()
+				Blockchain = append(Blockchain, newBlock)
+				mutex.Unlock()
+			}
+
+			bcServer <- Blockchain
+			io.WriteString(conn, "\nEnter a new BPM:")
+		}
 	}()
 
-	log.Fatal(run())
-}
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
 
-func run() error {
-	mux := makeMuxRouter()
-	httpPort := os.Getenv("PORT")
+			mutex.Lock()
+			output, err := json.MarshalIndent(Blockchain, "", "	")
 
-	log.Println("Listening on port", httpPort)
+			if err != nil {
+				log.Fatal(err)
+			}
+			mutex.Unlock()
 
-	s := &http.Server{
-		Addr:           ":" + httpPort,
-		Handler:        mux,
-		ReadTimeout:    10 * time.Second,
-		WriteTimeout:   10 * time.Second,
-		MaxHeaderBytes: 1 << 20,
-	}
+			io.WriteString(conn, "\n"+string(output))
+			io.WriteString(conn, "\nEnter a new BPM:")
+		}
+	}()
 
-	if err := s.ListenAndServe(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func makeMuxRouter() http.Handler {
-	muxRouter := mux.NewRouter()
-
-	muxRouter.HandleFunc("/", handleGetBlockchain).Methods("GET")
-	muxRouter.HandleFunc("/", handleWriteBlock).Methods("POST")
-
-	return muxRouter
-}
-
-func handleGetBlockchain(w http.ResponseWriter, r *http.Request) {
-	bytes, err := json.MarshalIndent(Blockchain, "", "	")
-
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	io.WriteString(w, string(bytes))
-}
-
-func handleWriteBlock(w http.ResponseWriter, r *http.Request) {
-	var m Message
-
-	decoder := json.NewDecoder(r.Body)
-
-	if err := decoder.Decode(&m); err != nil {
-		respondWithJSON(w, r, http.StatusBadRequest, r.Body)
-		return
-	}
-
-	defer r.Body.Close()
-
-	oldBlock := Blockchain[len(Blockchain)-1]
-
-	newBlock, err := generateBlock(oldBlock, m.BPM)
-
-	if err != nil {
-		respondWithJSON(w, r, http.StatusInternalServerError, m)
-		return
-	}
-
-	if isBlockValid(newBlock, oldBlock) {
-		Blockchain = append(Blockchain, newBlock)
+	for range bcServer {
 		spew.Dump(Blockchain)
 	}
-
-	respondWithJSON(w, r, http.StatusCreated, newBlock)
-}
-
-func respondWithJSON(w http.ResponseWriter, r *http.Request, code int, payload interface{}) {
-	response, err := json.MarshalIndent(payload, "", "	")
-
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
-		return
-	}
-
-	w.WriteHeader(code)
-	w.Write(response)
 }
 
 func isBlockValid(newBlock Block, oldBlock Block) bool {
