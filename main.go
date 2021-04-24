@@ -2,66 +2,30 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
 	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/joho/godotenv"
+	env "github.com/joho/godotenv"
 )
 
-const difficulty = 5
-
-type Block struct {
-	Index      int
-	Timestamp  string
-	BPM        int
-	Hash       string
-	PrevHash   string
-	Difficulty int
-	Nonce      string
-}
-
-var Blockchain []Block
-
-var mutex = &sync.Mutex{}
-
-var bcServer chan []Block
+var (
+	blockchain       *Blockchain
+	blockchainServer chan *Blockchain
+)
 
 func main() {
-	err := godotenv.Load()
-
-	if err != nil {
+	if err := env.Load(); err != nil {
 		log.Fatal(err)
 	}
 
-	bcServer = make(chan []Block)
+	blockchainServer = make(chan *Blockchain)
 
-	genesisBlock := Block{}
-	genesisBlock = Block{
-		Index:      0,
-		Timestamp:  time.Now().String(),
-		BPM:        0,
-		Hash:       calculateHash(genesisBlock),
-		PrevHash:   "",
-		Difficulty: difficulty,
-		Nonce:      "",
-	}
-
-	spew.Dump(genesisBlock)
-
-	mutex.Lock()
-	Blockchain = append(Blockchain, genesisBlock)
-	mutex.Unlock()
+	blockchain = NewBlockchain()
 
 	tcpPort := os.Getenv("PORT")
 
@@ -89,7 +53,9 @@ func main() {
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	io.WriteString(conn, "Enter a new BPM:")
+	connLogger := log.New(conn, "", log.LstdFlags)
+
+	connLogger.Print("Enter a new BPM:")
 
 	scanner := bufio.NewScanner(conn)
 
@@ -98,22 +64,19 @@ func handleConn(conn net.Conn) {
 			bpm, err := strconv.Atoi(scanner.Text())
 
 			if err != nil {
-				log.Printf("%v is not a number: %v", scanner.Text(), err)
+				connLogger.Printf("%v is not a number: %v", scanner.Text(), err)
 				continue
 			}
 
-			oldBlock := Blockchain[len(Blockchain)-1]
+			oldBlock := blockchain.Blocks[len(blockchain.Blocks)-1]
+			newBlock := NewBlock(conn, oldBlock.Hash, bpm)
 
-			newBlock := generateBlock(conn, oldBlock, bpm)
-
-			if isBlockValid(newBlock, oldBlock) {
-				mutex.Lock()
-				Blockchain = append(Blockchain, newBlock)
-				mutex.Unlock()
+			if newBlock.IsValid(oldBlock.Hash) {
+				blockchain.AddBlock(newBlock)
 			}
 
-			bcServer <- Blockchain
-			io.WriteString(conn, "\nEnter a new BPM:")
+			blockchainServer <- blockchain
+			connLogger.Print("Enter a new BPM:")
 		}
 	}()
 
@@ -121,79 +84,18 @@ func handleConn(conn net.Conn) {
 		for {
 			time.Sleep(30 * time.Second)
 
-			mutex.Lock()
-			output, err := json.MarshalIndent(Blockchain, "", "	")
+			output, err := json.MarshalIndent(blockchain, "", "	")
 
 			if err != nil {
 				log.Fatal(err)
 			}
-			mutex.Unlock()
 
-			io.WriteString(conn, "\n"+string(output))
-			io.WriteString(conn, "\nEnter a new BPM:")
+			connLogger.Print(string(output))
+			connLogger.Print("Enter a new BPM:")
 		}
 	}()
 
-	for range bcServer {
-		spew.Dump(Blockchain)
+	for range blockchainServer {
+		spew.Dump(blockchain.Blocks)
 	}
-}
-
-func isBlockValid(newBlock Block, oldBlock Block) bool {
-	if newBlock.Index != oldBlock.Index+1 {
-		return false
-	}
-
-	if newBlock.PrevHash != oldBlock.Hash {
-		return false
-	}
-
-	if newBlock.Hash != calculateHash(newBlock) {
-		return false
-	}
-
-	return true
-}
-
-func calculateHash(block Block) string {
-	record := strconv.Itoa(block.Index) + block.Timestamp + strconv.Itoa(block.BPM) + block.PrevHash + block.Nonce
-	h := sha256.New()
-	h.Write([]byte(record))
-	hashed := h.Sum(nil)
-	return hex.EncodeToString(hashed)
-}
-
-func generateBlock(conn net.Conn, oldBlock Block, bpm int) Block {
-	var newBlock Block
-
-	newBlock.Index = oldBlock.Index + 1
-	newBlock.Timestamp = time.Now().String()
-	newBlock.BPM = bpm
-	newBlock.PrevHash = oldBlock.Hash
-	newBlock.Difficulty = difficulty
-
-	startTime := time.Now()
-
-	for i := 0; ; i++ {
-		nonce := fmt.Sprintf("%x", i)
-		newBlock.Nonce = nonce
-
-		hash := calculateHash(newBlock)
-
-		if !isHashValid(hash, newBlock.Difficulty) {
-			io.WriteString(conn, hash+" do more work!\n")
-			continue
-		} else {
-			io.WriteString(conn, hash+" work done in "+time.Since(startTime).String()+"!\n")
-			newBlock.Hash = hash
-			break
-		}
-	}
-
-	return newBlock
-}
-
-func isHashValid(hash string, difficulty int) bool {
-	prefix := strings.Repeat("0", difficulty)
-	return strings.HasPrefix(hash, prefix)
 }
