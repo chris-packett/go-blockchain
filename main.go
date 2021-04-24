@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,12 +19,16 @@ import (
 	"github.com/joho/godotenv"
 )
 
+const difficulty = 5
+
 type Block struct {
-	Index     int
-	Timestamp string
-	BPM       int
-	Hash      string
-	PrevHash  string
+	Index      int
+	Timestamp  string
+	BPM        int
+	Hash       string
+	PrevHash   string
+	Difficulty int
+	Nonce      string
 }
 
 var Blockchain []Block
@@ -42,11 +48,13 @@ func main() {
 
 	genesisBlock := Block{}
 	genesisBlock = Block{
-		Index:     0,
-		Timestamp: time.Now().String(),
-		BPM:       0,
-		Hash:      calculateHash(genesisBlock),
-		PrevHash:  "",
+		Index:      0,
+		Timestamp:  time.Now().String(),
+		BPM:        0,
+		Hash:       calculateHash(genesisBlock),
+		PrevHash:   "",
+		Difficulty: difficulty,
+		Nonce:      "",
 	}
 
 	spew.Dump(genesisBlock)
@@ -96,12 +104,7 @@ func handleConn(conn net.Conn) {
 
 			oldBlock := Blockchain[len(Blockchain)-1]
 
-			newBlock, err := generateBlock(oldBlock, bpm)
-
-			if err != nil {
-				log.Println(err)
-				continue
-			}
+			newBlock := generateBlock(conn, oldBlock, bpm)
 
 			if isBlockValid(newBlock, oldBlock) {
 				mutex.Lock()
@@ -153,21 +156,44 @@ func isBlockValid(newBlock Block, oldBlock Block) bool {
 }
 
 func calculateHash(block Block) string {
-	record := string(block.Index) + block.Timestamp + string(block.BPM) + block.PrevHash
+	record := strconv.Itoa(block.Index) + block.Timestamp + strconv.Itoa(block.BPM) + block.PrevHash + block.Nonce
 	h := sha256.New()
 	h.Write([]byte(record))
 	hashed := h.Sum(nil)
 	return hex.EncodeToString(hashed)
 }
 
-func generateBlock(oldBlock Block, bpm int) (Block, error) {
+func generateBlock(conn net.Conn, oldBlock Block, bpm int) Block {
 	var newBlock Block
 
 	newBlock.Index = oldBlock.Index + 1
 	newBlock.Timestamp = time.Now().String()
 	newBlock.BPM = bpm
 	newBlock.PrevHash = oldBlock.Hash
-	newBlock.Hash = calculateHash(newBlock)
+	newBlock.Difficulty = difficulty
 
-	return newBlock, nil
+	startTime := time.Now()
+
+	for i := 0; ; i++ {
+		nonce := fmt.Sprintf("%x", i)
+		newBlock.Nonce = nonce
+
+		hash := calculateHash(newBlock)
+
+		if !isHashValid(hash, newBlock.Difficulty) {
+			io.WriteString(conn, hash+" do more work!\n")
+			continue
+		} else {
+			io.WriteString(conn, hash+" work done in "+time.Since(startTime).String()+"!\n")
+			newBlock.Hash = hash
+			break
+		}
+	}
+
+	return newBlock
+}
+
+func isHashValid(hash string, difficulty int) bool {
+	prefix := strings.Repeat("0", difficulty)
+	return strings.HasPrefix(hash, prefix)
 }
